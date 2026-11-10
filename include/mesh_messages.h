@@ -2,6 +2,7 @@
 #define MESH_MESSAGES_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef enum
 {
@@ -11,11 +12,12 @@ typedef enum
     MSG_ACK
 } message_type_t;
 
-typedef struct
-{
-    uint8_t node_id;
-    message_type_t msg_type;
-     int64_t timestamp;
+typedef struct {
+    uint32_t node_id;          // Avsändarens nod-ID
+    message_type_t msg_type;   // Meddelandetyp
+    int64_t timestamp;         // Tidsstämpel för latensmätning
+    bool alarm_active;         // True om larm är aktivt
+    uint16_t person_count;     // Antal personer i zonen
 } mesh_message_t;
 
 #endif
