@@ -2,7 +2,7 @@
 #define CONFIG_H
 
 #ifndef MESH_NODE_ID
-#define MESH_NODE_ID 2
+#define MESH_NODE_ID 1
 #endif
 
 #endif

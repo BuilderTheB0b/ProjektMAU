@@ -21,9 +21,10 @@ static bool local_alarm_active = false;
 
 void mesh_tx_task(void *arg)
 {
+
     const TickType_t heartbeat_interval = pdMS_TO_TICKS(1000);
     TickType_t last_heartbeat = xTaskGetTickCount() - heartbeat_interval;
-    int previous_button_level = 1;
+    int previous_button_level = 0;
 
     while (true)
     {
@@ -39,6 +40,8 @@ void mesh_tx_task(void *arg)
         if (alarm_pressed)
         {
             local_alarm_active = true;
+             ESP_LOGW(TAG_TX, "BRANDLARM AKTIVERAT! Nod ID: %d",
+             MESH_NODE_ID);
         }
 
         const TickType_t now = xTaskGetTickCount();
@@ -134,8 +137,8 @@ void mesh_rx_task(void *arg)
             switch (msg.msg_type)
             {
                 case MSG_HEARTBEAT:
-                    ESP_LOGI(TAG_RX, "Heartbeat från nod %lu (latens: %lld us)",
-                             (unsigned long)msg.node_id, latency_us);
+                    ESP_LOGI(TAG_RX, "Heartbeat från nod %lu (latens: %lld us) personantal %d",
+                             (unsigned long)msg.node_id, latency_us,msg.person_count);
                     break;
 
                 case MSG_ALARM_ON:

@@ -1,87 +1,129 @@
 #include <string.h>
+
+#include "driver/gpio.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mesh.h"
-#include "esp_wifi.h"
-#include "nvs_flash.h"
-#include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_wifi_default.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+
 #include "mesh_tasks.h"
-#include "driver/gpio.h"
 
 #define BUTTON_PIN GPIO_NUM_14
 
+#ifndef MESH_NODE_ID
+#error "Ange MESH_NODE_ID i PlatformIO build_flags"
+#endif
+
 static const char *TAG = "MESH_NO_ROUTER";
-static uint8_t MESH_ID[6] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
+static const uint8_t MESH_ID[] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
+
+static void mesh_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    switch (event_id) {
+    case MESH_EVENT_STARTED:
+        ESP_LOGI(TAG, "Mesh startad");
+        break;
+
+    case MESH_EVENT_PARENT_CONNECTED: {
+        const mesh_event_connected_t *event = event_data;
+        ESP_LOGI(TAG, "Ansluten till parent, Layer=%d", event->self_layer);
+        break;
+    }
+
+    case MESH_EVENT_PARENT_DISCONNECTED: {
+        const mesh_event_disconnected_t *event = event_data;
+        ESP_LOGW(TAG, "Tappade parent, reason=%d", event->reason);
+        break;
+    }
+
+    case MESH_EVENT_NO_PARENT_FOUND:
+        ESP_LOGW(TAG, "Hittade ingen parent");
+        break;
+
+    case MESH_EVENT_CHILD_CONNECTED:
+        ESP_LOGI(TAG, "En barnnod anslöt");
+        break;
+
+    default:
+        break;
+    }
+}
 
 void app_main(void)
 {
+    esp_log_level_set("mesh", ESP_LOG_INFO);
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("wifi_init", ESP_LOG_WARN);
-    esp_log_level_set("mesh", ESP_LOG_WARN);
     esp_log_level_set("phy_init", ESP_LOG_WARN);
-    // Konfigurera larmknappen på GPIO 14
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_PIN),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
+
+    const gpio_config_t button_config = {
+        .pin_bit_mask = 1ULL << BUTTON_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
+    ESP_ERROR_CHECK(gpio_config(&button_config));
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    esp_netif_t *mesh_sta_netif = NULL;
+    ESP_ERROR_CHECK(
+        esp_netif_create_default_wifi_mesh_netifs(&mesh_sta_netif, NULL)
+    );
+
+    wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_config));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_ERROR_CHECK(esp_mesh_init());
 
-    mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
-    memcpy(cfg.mesh_id.addr, MESH_ID, 6);
+    // Ställ in rollen innan mesh-konfigurationen valideras.
+#if MESH_NODE_ID == 1
+    ESP_LOGI(TAG, "Nod %d startar som ROOT", MESH_NODE_ID);
+    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
+#else
+    ESP_LOGI(TAG, "Nod %d startar som CHILD", MESH_NODE_ID);
+    ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+#endif
 
-    cfg.channel = 6;
-    cfg.mesh_ap.max_connection = 6;
-    strcpy((char *)cfg.mesh_ap.password, "evakuering123");
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        MESH_EVENT, ESP_EVENT_ANY_ID, mesh_event_handler, NULL
+    ));
 
-    strcpy((char *)cfg.router.ssid, "NO_ROUTER");
-    cfg.router.ssid_len = strlen("NO_ROUTER");
-    strcpy((char *)cfg.router.password, "12345678");
-
-    ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
     ESP_ERROR_CHECK(esp_mesh_set_topology(MESH_TOPO_TREE));
     ESP_ERROR_CHECK(esp_mesh_set_max_layer(6));
+    ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(WIFI_AUTH_WPA2_PSK));
 
-    // Styr startroll utifrån MESH_NODE_ID men tillåt dynamisk failover
-    #if (MESH_NODE_ID == 1)
-        ESP_LOGI(TAG, "Startar som initiell ROOT");
-        ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
-    #else
-        ESP_LOGI(TAG, "Startar som CHILD (söker efter Root)");
-        ESP_ERROR_CHECK(esp_mesh_set_type(MESH_IDLE));    
-    #endif
+    mesh_cfg_t config = MESH_INIT_CONFIG_DEFAULT();
+    memcpy(config.mesh_id.addr, MESH_ID, sizeof(MESH_ID));
 
-    // Tillåt att rollen kan ändras dynamiskt vid bortfall
-    ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+    config.channel = 6;
+    config.mesh_ap.max_connection = 6;
+    strcpy((char *)config.mesh_ap.password, "evakuering123");
 
+    // Routerfältet lämnas tomt för routerlös drift.
+    ESP_ERROR_CHECK(esp_mesh_set_config(&config));
     ESP_ERROR_CHECK(esp_mesh_start());
 
-    ESP_LOGI(TAG, "Startar RX task");
+    ESP_LOGI(TAG, "Startar RX- och TX-taskar");
     xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
-
-    ESP_LOGI(TAG, "Startar TX task");
     xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 
-    while (true)
-    {      
-        ESP_LOGI(TAG,
-            "Layer=%d Root=%d Ansluten=%d",
-            esp_mesh_get_layer(),
-            esp_mesh_is_root(),
-            (esp_mesh_is_root() || esp_mesh_get_layer() > 0));
+    while (true) {
+        const int layer = esp_mesh_get_layer();
+
+        ESP_LOGI(TAG, "Nod=%d Layer=%d Root=%d",
+                 MESH_NODE_ID, layer, esp_mesh_is_root());
 
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
