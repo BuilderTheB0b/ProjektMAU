@@ -1,185 +1,186 @@
 #include "mesh_tasks.h"
 
-#include <string.h>
 #include <stdbool.h>
+#include <string.h>
 
+#include "config.h"
+#include "mesh_messages.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_mesh.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
-
-#include "mesh_messages.h"
-#include "config.h"
 
 #define BUTTON_PIN GPIO_NUM_14
+#define DEBOUNCE_MS 50
+#define HEARTBEAT_MS 1000
+#define ROUTING_TABLE_CAPACITY 50
 
-static const char *TAG_RX = "MESH_RX";
-static const char *TAG_TX = "MESH_TX";
-
+static const char *TAG = "MESH_ALARM";
 static bool local_alarm_active = false;
+
+/* Root sends a separate P2P packet to every address in its routing table.
+   MESH_DATA_TODS is NOT a broadcast flag. */
+static void root_fanout(const mesh_message_t *message)
+{
+    mesh_addr_t routes[ROUTING_TABLE_CAPACITY];
+    int route_count = 0;
+    esp_err_t err = esp_mesh_get_routing_table(
+        routes, sizeof(routes), &route_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Routing table: %s", esp_err_to_name(err));
+        return;
+    }
+
+    mesh_addr_t self = {0};
+    esp_mesh_get_id(&self);
+    mesh_data_t data = {
+        .data = (uint8_t *)message,
+        .size = sizeof(*message),
+        .proto = MESH_PROTO_BIN,
+        .tos = MESH_TOS_P2P
+    };
+
+    for (int i = 0; i < route_count; ++i) {
+        if (memcmp(routes[i].addr, self.addr, sizeof(self.addr)) == 0) {
+            continue;
+        }
+        err = esp_mesh_send(&routes[i], &data, 0, NULL, 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Alarm till route %d misslyckades: %s",
+                     i, esp_err_to_name(err));
+        }
+    }
+    ESP_LOGI(TAG, "Root skickade alarm till routingtabellen (%d poster)",
+             route_count);
+}
+
+static void send_to_root(const mesh_message_t *message)
+{
+    mesh_addr_t root = {0};
+    esp_err_t err = esp_mesh_get_root_addr(&root);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Ingen root-adress: %s", esp_err_to_name(err));
+        return;
+    }
+
+    mesh_data_t data = {
+        .data = (uint8_t *)message,
+        .size = sizeof(*message),
+        .proto = MESH_PROTO_BIN,
+        .tos = MESH_TOS_P2P
+    };
+    err = esp_mesh_send(&root, &data, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Sändning till root misslyckades: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void send_message(message_type_t type)
+{
+    mesh_message_t message = {
+        .node_id = MESH_NODE_ID,
+        .msg_type = type,
+        .timestamp = esp_mesh_get_tsf_time(),
+        .alarm_active = local_alarm_active,
+        .person_count = 0
+    };
+
+    if (esp_mesh_is_root()) {
+        if (type == MSG_ALARM_ON) {
+            root_fanout(&message);
+        }
+    } else if (esp_mesh_get_layer() > 0) {
+        send_to_root(&message);
+    } else {
+        ESP_LOGW(TAG, "Ingen mesh-anslutning; lokalt larm kvarstår");
+    }
+}
 
 void mesh_tx_task(void *arg)
 {
+    (void)arg;
+    const TickType_t debounce = pdMS_TO_TICKS(DEBOUNCE_MS);
+    const TickType_t heartbeat = pdMS_TO_TICKS(HEARTBEAT_MS);
+    int stable_level = gpio_get_level(BUTTON_PIN);
+    int last_sample = stable_level;
+    TickType_t changed_at = xTaskGetTickCount();
+    TickType_t last_heartbeat = xTaskGetTickCount();
 
-    const TickType_t heartbeat_interval = pdMS_TO_TICKS(1000);
-    TickType_t last_heartbeat = xTaskGetTickCount() - heartbeat_interval;
-    int previous_button_level = 0;
-
-    while (true)
-    {
-        const int button_level = gpio_get_level(BUTTON_PIN);
-        const bool alarm_pressed = (previous_button_level == 1 && button_level == 0);
-
-        if (button_level != previous_button_level)
-        {
-            ESP_LOGI("BUTTON", "GPIO14 läge = %d", button_level);
-            previous_button_level = button_level;
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+        int sample = gpio_get_level(BUTTON_PIN);
+        if (sample != last_sample) {
+            last_sample = sample;
+            changed_at = now;
         }
 
-        if (alarm_pressed)
-        {
-            local_alarm_active = true;
-             ESP_LOGW(TAG_TX, "BRANDLARM AKTIVERAT! Nod ID: %d",
-             MESH_NODE_ID);
-        }
-
-        const TickType_t now = xTaskGetTickCount();
-        const bool heartbeat_due = (now - last_heartbeat) >= heartbeat_interval;
-
-        // Kontrollera att noden är ansluten till nätverket innan sändning görs
-        bool is_connected = esp_mesh_is_root() || (esp_mesh_get_layer() > 0);
-
-        if (is_connected && (alarm_pressed || (!esp_mesh_is_root() && heartbeat_due)))
-        {
-            mesh_message_t msg = {
-                .node_id = MESH_NODE_ID,
-                .msg_type = alarm_pressed ? MSG_ALARM_ON : MSG_HEARTBEAT,
-                .timestamp = esp_mesh_get_tsf_time(),
-                .alarm_active = local_alarm_active,
-                .person_count = 0
-            };
-
-            mesh_data_t data = {
-                .data = (uint8_t *)&msg,
-                .size = sizeof(msg),
-                .proto = MESH_PROTO_BIN,
-                .tos = MESH_TOS_P2P
-            };
-
-            esp_err_t err;
-
-            if (esp_mesh_is_root())
-            {
-                // Om root skickar (eget knapptryck): sänd nedåt i trädet till alla barn
-                err = esp_mesh_send(NULL, &data, MESH_DATA_TODS, NULL, 0);
-            }
-            else
-            {
-                // Vanlig nod: skicka uppåt mot root
-                err = esp_mesh_send(NULL, &data, 0, NULL, 0);
-            }
-
-            if (err == ESP_OK)
-            {
-                ESP_LOGI(TAG_TX, "Skickat: nod=%lu typ=%d larm=%d",
-                         (unsigned long)msg.node_id, msg.msg_type, msg.alarm_active);
-            }
-            else
-            {
-                ESP_LOGE(TAG_TX, "Sändning misslyckades: %s", esp_err_to_name(err));
-            }
-
-            if (!alarm_pressed)
-            {
-                last_heartbeat = now;
+        if ((now - changed_at) >= debounce && sample != stable_level) {
+            stable_level = sample;
+            if (stable_level == 0) {
+                local_alarm_active = true;
+                ESP_LOGW(TAG, "BRANDLARM AKTIVERAT lokalt på nod %d", MESH_NODE_ID);
+                send_message(MSG_ALARM_ON);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20)); // Avstudsning
+        if ((now - last_heartbeat) >= heartbeat) {
+            last_heartbeat = now;
+            if (!esp_mesh_is_root() && esp_mesh_get_layer() > 0) {
+                send_message(MSG_HEARTBEAT);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void mesh_rx_task(void *arg)
 {
-    ESP_LOGI(TAG_RX, "RX task startad");
+    (void)arg;
+    mesh_addr_t from = {0};
+    mesh_message_t message;
+    mesh_data_t data = {
+        .data = (uint8_t *)&message,
+        .size = sizeof(message)
+    };
 
-    mesh_addr_t from;
-    mesh_data_t data = {0};
-    mesh_message_t msg;
-
-    data.data = (uint8_t *)&msg;
-
-    while (true)
-    {
-        data.size = sizeof(msg);
-
+    while (true) {
+        data.size = sizeof(message);
         esp_err_t err = esp_mesh_recv(
-            &from,
-            &data,
-            portMAX_DELAY,
-            NULL,
-            NULL,
-            0);
-
-        if (err == ESP_OK)
-        {
-            if (data.size != sizeof(msg))
-            {
-                ESP_LOGW(TAG_RX, "Felaktig storlek: mottog %u, förväntade %u",
-                         (unsigned)data.size, (unsigned)sizeof(msg));
-                continue;
-            }
-
-            int64_t rx_time = esp_mesh_get_tsf_time();
-            int64_t latency_us = rx_time - msg.timestamp;
-
-            switch (msg.msg_type)
-            {
-                case MSG_HEARTBEAT:
-                    ESP_LOGI(TAG_RX, "Heartbeat från nod %lu (latens: %lld us) personantal %d",
-                             (unsigned long)msg.node_id, latency_us,msg.person_count);
-                    break;
-
-                case MSG_ALARM_ON:
-                    local_alarm_active = true;
-                    ESP_LOGW(TAG_RX, "🚨 BRANDLARM MOTTAGET från nod %lu!", (unsigned long)msg.node_id);
-
-                    // Om noden är Root: sprid vidare larmet nedåt till resten av nätverket
-                    if (esp_mesh_is_root())
-                    {
-                        mesh_data_t fwd_data = {
-                            .data = (uint8_t *)&msg,
-                            .size = sizeof(msg),
-                            .proto = MESH_PROTO_BIN,
-                            .tos = MESH_TOS_P2P
-                        };
-
-                        esp_err_t fwd_err = esp_mesh_send(NULL, &fwd_data, MESH_DATA_TODS, NULL, 0);
-                        if (fwd_err == ESP_OK)
-                        {
-                            ESP_LOGI(TAG_RX, "Root vidarebefordrade larmet till alla noder.");
-                        }
-                        else
-                        {
-                            ESP_LOGE(TAG_RX, "Vidarebefordran misslyckades: %s", esp_err_to_name(fwd_err));
-                        }
-                    }
-                    break;
-
-                case MSG_ALARM_OFF:
-                    local_alarm_active = false;
-                    ESP_LOGI(TAG_RX, "Larm återställt från nod %lu", (unsigned long)msg.node_id);
-                    break;
-
-                default:
-                    ESP_LOGW(TAG_RX, "Okänd meddelandetyp %d", (int)msg.msg_type);
-                    break;
-            }
+            &from, &data, portMAX_DELAY, NULL, NULL, 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Mottagning: %s", esp_err_to_name(err));
+            continue;
         }
-        else
-        {
-            ESP_LOGE(TAG_RX, "Mottagning misslyckades: %s", esp_err_to_name(err));
+        if (data.size != sizeof(message)) {
+            ESP_LOGW(TAG, "Ogiltig meddelandestorlek: %u", (unsigned)data.size);
+            continue;
+        }
+
+        switch (message.msg_type) {
+        case MSG_HEARTBEAT:
+            ESP_LOGI(TAG, "Heartbeat fran nod %lu, personer=%u",
+                     (unsigned long)message.node_id,
+                     (unsigned)message.person_count);
+            break;
+        case MSG_ALARM_ON:
+            local_alarm_active = true;
+            ESP_LOGW(TAG, "BRANDLARM MOTTAGET fran nod %lu",
+                     (unsigned long)message.node_id);
+            if (esp_mesh_is_root()) {
+                root_fanout(&message);
+            }
+            break;
+        case MSG_ALARM_OFF:
+            ESP_LOGW(TAG, "MSG_ALARM_OFF ignoreras i detta test; larmet ar latched");
+            break;
+        case MSG_ACK:
+            ESP_LOGI(TAG, "ACK fran nod %lu", (unsigned long)message.node_id);
+            break;
+        default:
+            ESP_LOGW(TAG, "Okand meddelandetyp: %d", (int)message.msg_type);
+            break;
         }
     }
 }
