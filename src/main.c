@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "evacuation.h"
 
 #include "mesh_tasks.h"
 
@@ -55,12 +56,46 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+
+
+static void test_dijkstra(void)
+{
+    // Skapa information om alla 18 noder.
+    // Alla börjar som status normal med 0 personer.
+    evac_node_state_t states[EVAC_NUM_NODES] = {0};
+
+    // Simulera brand i nod 1.
+    //states[1].status = EVAC_NODE_FIRE;
+
+    // Simulera 20 personer i nod 6.
+    //states[6].people_count = 20;
+
+    // Beräkna väg från nod 0.
+    evacuation_result_t result =
+        evacuation_calculate_route(0, states);
+
+    if (result.route_found) {
+        ESP_LOGI("DIJKSTRA",
+                 "Nästa nod: %d | Utgång: %d | Kostnad: %.1f",
+                 result.next_node,
+                 result.target_exit,
+                 result.total_cost);
+    } else {
+        ESP_LOGW("DIJKSTRA", "Ingen väg hittades!");
+    }
+}
+
+
+
 void app_main(void)
 {
     esp_log_level_set("mesh", ESP_LOG_INFO);
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("wifi_init", ESP_LOG_WARN);
     esp_log_level_set("phy_init", ESP_LOG_WARN);
+
+
+    test_dijkstra();
 
     const gpio_config_t button_config = {
         .pin_bit_mask = 1ULL << BUTTON_PIN,
@@ -87,14 +122,19 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_mesh_init());
 
+
     // Ställ in rollen innan mesh-konfigurationen valideras.
+ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+
 #if MESH_NODE_ID == 1
     ESP_LOGI(TAG, "Nod %d startar som ROOT", MESH_NODE_ID);
     ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
 #else
     ESP_LOGI(TAG, "Nod %d startar som CHILD", MESH_NODE_ID);
-    ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+    // Child-rollen tilldelas vid anslutning
 #endif
+
+
 
     ESP_ERROR_CHECK(esp_event_handler_register(
         MESH_EVENT, ESP_EVENT_ANY_ID, mesh_event_handler, NULL
@@ -122,8 +162,12 @@ void app_main(void)
     while (true) {
         const int layer = esp_mesh_get_layer();
 
-        ESP_LOGI(TAG, "Nod=%d Layer=%d Root=%d",
-                 MESH_NODE_ID, layer, esp_mesh_is_root());
+        ESP_LOGI(TAG,
+            "Nod=%d | Layer=%d | Root=%d | ParentConnected=%d",
+            MESH_NODE_ID,
+            layer,
+            esp_mesh_is_root(),
+            esp_mesh_get_parent_bssid(NULL) == ESP_OK);
 
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
