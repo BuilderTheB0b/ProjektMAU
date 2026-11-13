@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define EVAC_NUM_NODES 18
+#define EVAC_NUM_NODES 3
 #define EVAC_BUFFER_PENALTY 15.0f
 #define EVAC_PEOPLE_FACTOR 0.5f
 
