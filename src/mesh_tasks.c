@@ -168,8 +168,12 @@ void mesh_rx_task(void *arg)
             switch (msg.msg_type)
             {
                 case MSG_HEARTBEAT:
-                    // Heartbeat mottaget.
-                    // Ingen loggutskrift för varje meddelande.
+                    ESP_LOGI(TAG_RX,
+                    "Heartbeat från nod %lu (latens: %lld us) personantal %d",
+                    (unsigned long)msg.node_id,
+                    (long long)latency_us,
+                    msg.person_count);
+
                     break;
 
                 case MSG_ALARM_ON:

@@ -159,16 +159,24 @@ ESP_ERROR_CHECK(esp_mesh_fix_root(true));
     xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
     xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 
-    while (true) {
+    
+    while (true)
+    {
         const int layer = esp_mesh_get_layer();
+
+        mesh_addr_t parent = {0};
+
+        esp_err_t parent_result =
+            esp_mesh_get_parent_bssid(&parent);
 
         ESP_LOGI(TAG,
             "Nod=%d | Layer=%d | Root=%d | ParentConnected=%d",
             MESH_NODE_ID,
             layer,
             esp_mesh_is_root(),
-            esp_mesh_get_parent_bssid(NULL) == ESP_OK);
+            parent_result == ESP_OK);
 
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+
 }
